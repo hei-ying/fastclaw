@@ -197,6 +197,38 @@ func (d *DBStore) Migrate(ctx context.Context) error {
 	if err := d.migrateBillingHooks(ctx); err != nil {
 		return fmt.Errorf("migrate billing hooks: %w", err)
 	}
+	if err := d.migrateMachinesAddSettings(ctx); err != nil {
+		return fmt.Errorf("migrate machines settings: %w", err)
+	}
+	return nil
+}
+
+// migrateMachinesAddSettings adds the per-machine settings LLM agents
+// honour when they dispatch to the machine (docs/agl-machines.md "Tool
+// mode"): allow_agents, default_access, default_cwd. Idempotent.
+func (d *DBStore) migrateMachinesAddSettings(ctx context.Context) error {
+	cols := []struct{ table, name, ddl string }{
+		{"machines", "allow_agents", `ALTER TABLE machines ADD COLUMN allow_agents INTEGER NOT NULL DEFAULT 1`},
+		{"machines", "default_access", `ALTER TABLE machines ADD COLUMN default_access TEXT NOT NULL DEFAULT 'ask'`},
+		{"machines", "default_cwd", `ALTER TABLE machines ADD COLUMN default_cwd TEXT NOT NULL DEFAULT ''`},
+		// Per local agent: enabled, model, effort (JSON keyed by agent id).
+		{"machines", "agent_settings", `ALTER TABLE machines ADD COLUMN agent_settings TEXT NOT NULL DEFAULT '{}'`},
+		// The hub address a machine paired through (per-product hubs).
+		{"machines", "hub_scope", `ALTER TABLE machines ADD COLUMN hub_scope TEXT NOT NULL DEFAULT ''`},
+		{"machine_pairings", "scope", `ALTER TABLE machine_pairings ADD COLUMN scope TEXT NOT NULL DEFAULT ''`},
+	}
+	for _, c := range cols {
+		has, err := d.tableHasColumn(ctx, c.table, c.name)
+		if err != nil {
+			return err
+		}
+		if has {
+			continue
+		}
+		if _, err := d.db.ExecContext(ctx, c.ddl); err != nil {
+			return fmt.Errorf("add %s.%s: %w", c.table, c.name, err)
+		}
+	}
 	return nil
 }
 
@@ -2232,6 +2264,45 @@ func (d *DBStore) migrationSQL() []string {
 			UNIQUE (type, account_id)
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_channels_user ON channels (user_id, agent_id)`,
+		// machines are users' own computers linked through agl ("connect
+		// my computer", see docs/agl-machines.md). token_hash is
+		// sha256(machine token); revoking clears it so the token fails at
+		// the next upgrade. Times are unix milliseconds.
+		`CREATE TABLE IF NOT EXISTS machines (
+			id TEXT PRIMARY KEY,
+			user_id TEXT NOT NULL,
+			agl_machine_id TEXT NOT NULL DEFAULT '',
+			name TEXT NOT NULL DEFAULT '',
+			hostname TEXT NOT NULL DEFAULT '',
+			os TEXT NOT NULL DEFAULT '',
+			arch TEXT NOT NULL DEFAULT '',
+			version TEXT NOT NULL DEFAULT '',
+			agents TEXT NOT NULL DEFAULT '[]',
+			token_hash TEXT NOT NULL DEFAULT '',
+			last_seen_at BIGINT NOT NULL DEFAULT 0,
+			created_at BIGINT NOT NULL DEFAULT 0,
+			revoked_at BIGINT NOT NULL DEFAULT 0,
+			allow_agents INTEGER NOT NULL DEFAULT 1,
+			default_access TEXT NOT NULL DEFAULT 'ask',
+			default_cwd TEXT NOT NULL DEFAULT '',
+			agent_settings TEXT NOT NULL DEFAULT '{}',
+			hub_scope TEXT NOT NULL DEFAULT ''
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_machines_user ON machines (user_id, created_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_machines_token ON machines (token_hash)`,
+		`CREATE INDEX IF NOT EXISTS idx_machines_agl ON machines (agl_machine_id)`,
+		// machine_pairings holds one-time pairing codes (only their
+		// sha256 is stored): 10 minutes, single use.
+		`CREATE TABLE IF NOT EXISTS machine_pairings (
+			code_hash TEXT PRIMARY KEY,
+			user_id TEXT NOT NULL,
+			expires_at BIGINT NOT NULL,
+			used_at BIGINT NOT NULL DEFAULT 0,
+			machine_id TEXT NOT NULL DEFAULT '',
+			created_at BIGINT NOT NULL DEFAULT 0,
+			scope TEXT NOT NULL DEFAULT ''
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_machine_pairings_user ON machine_pairings (user_id)`,
 	}
 }
 

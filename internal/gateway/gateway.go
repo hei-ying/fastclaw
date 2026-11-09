@@ -26,6 +26,7 @@ import (
 	"github.com/fastclaw-ai/fastclaw/internal/agent"
 	"github.com/fastclaw-ai/fastclaw/internal/agent/tools"
 	"github.com/fastclaw-ai/fastclaw/internal/agentcli"
+	"github.com/fastclaw-ai/fastclaw/internal/agl"
 	"github.com/fastclaw-ai/fastclaw/internal/bus"
 	"github.com/fastclaw-ai/fastclaw/internal/channels"
 	"github.com/fastclaw-ai/fastclaw/internal/config"
@@ -238,8 +239,14 @@ type Gateway struct {
 	// SSE hub a user-typed POST /api/chat turn uses. Nil-safe: unset
 	// keeps the legacy bus.Outbound → WebChannel async-bubble path.
 	chatEvents *agent.EventHub
-	mu         sync.RWMutex
-	dedup      sync.Map
+	// aglBridge runs IM turns of runtime "agl" agents on the owner's
+	// linked computer instead of the LLM (agl.go). Nil = off.
+	aglBridge *agl.Bridge
+	// aglTools runs local_agents / run_local_agent for LLM agents and
+	// holds their chats' open permission requests.
+	aglTools *agl.Tools
+	mu       sync.RWMutex
+	dedup    sync.Map
 	// pairFails counts wrong /pair attempts per channel row id (see
 	// pairing.go); the outstanding code is burned once it hits the cap.
 	pairFails sync.Map
@@ -1009,7 +1016,7 @@ func splitFilesFromReply(ctx context.Context, ws workspace.Store, agentID, proje
 // the gateway resolves against (sessions/<chatID>/). Turns that run
 // without a session scope — cron jobs, web-dashboard default scope,
 // and anything that shells out to a host tool whose cwd is the
-// agent-shared root (`exec`, the local-coding-agents hand-off) — drop
+// agent-shared root (`exec`) — drop
 // their files directly under <root>/<agent>/. Resolving only the
 // session scope therefore misses the file, and the image is silently
 // stripped from the reply with nothing sent to the IM channel.
