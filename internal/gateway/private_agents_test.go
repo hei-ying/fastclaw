@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -50,7 +51,7 @@ func TestMessageAgentStaysWithinOwner(t *testing.T) {
 	if !alice.Agents.Has("agt_a1") || !alice.Agents.Has("agt_a2") || alice.Agents.Has("agt_b1") {
 		t.Fatalf("alice's space loaded %v, want exactly her private agents", alice.Agents.Names())
 	}
-	resolve := messageAgentResolver(func() *UserSpace { return alice }, st, mb, nil, "u_alice", "app")
+	resolve := messageAgentResolver(func() *UserSpace { return alice }, st, mb, nil, "u_alice", "app", "u_alice")
 
 	for _, ref := range []string{"agt_a2", "reviewer"} {
 		ag, err := resolve(ctx, "u_alice", ref)
@@ -84,7 +85,7 @@ func TestMessageAgentStaysWithinOwner(t *testing.T) {
 	if app.Agents.Has("agt_a1") || app.Agents.Has("agt_b1") {
 		t.Fatalf("account space loaded private agents: %v", app.Agents.Names())
 	}
-	resolveApp := messageAgentResolver(func() *UserSpace { return app }, st, mb, nil, "app", "")
+	resolveApp := messageAgentResolver(func() *UserSpace { return app }, st, mb, nil, "app", "", "")
 	if ag, err := resolveApp(ctx, "app", "Billing"); err != nil || ag.Name() != "agt_plat2" {
 		t.Fatalf("platform → platform: %v %v", ag, err)
 	}
@@ -124,5 +125,105 @@ func TestPrivateAgentBackgroundWorkBelongsToOwner(t *testing.T) {
 	}
 	if app.IsPinned("agt_a1") || app.Agents.Has("agt_a1") {
 		t.Fatal("the account's space must not run its end-users' private agents")
+	}
+}
+
+// An account's agents marked for its end users (endUserVisibility /
+// endUserOwner) are reachable through message_agent in an end user's
+// space: public ones by everyone, an owned one (e.g. a draft) only by its
+// end user, unmarked ones by no one; and the account's agents running
+// there still never reach the end user's own private agents.
+func TestMessageAgentReachesMarkedAccountAgents(t *testing.T) {
+	st := privateAgentFixture(t)
+	ctx := context.Background()
+	for _, a := range []store.AgentRecord{
+		{ID: "agt_pub", UserID: "app", Name: "小微", Config: map[string]any{store.AgentCfgEndUserVisibility: store.EndUserVisibilityPublic}},
+		{ID: "agt_adraft", UserID: "app", Name: "Alice Draft", Config: map[string]any{store.AgentCfgEndUserVisibility: store.EndUserVisibilityPrivate, store.AgentCfgEndUserOwner: "u_alice"}},
+		{ID: "agt_bdraft", UserID: "app", Name: "Bob Draft", Config: map[string]any{store.AgentCfgEndUserVisibility: store.EndUserVisibilityPrivate, store.AgentCfgEndUserOwner: "u_bob"}},
+	} {
+		a := a
+		if err := st.SaveAgent(ctx, &a); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mb := bus.New()
+	alice, err := loadUserSpace(ctx, "u_alice", mb, st, nil, nil, nil, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolve := messageAgentResolver(func() *UserSpace { return alice }, st, mb, nil, "u_alice", "app", "u_alice")
+
+	for _, c := range []struct{ caller, ref, want string }{
+		{"app", "小微", "agt_pub"},
+		{"app", "agt_pub", "agt_pub"},
+		{"app", "alice draft", "agt_adraft"},
+		{"u_alice", "小微", "agt_pub"},
+		{"u_alice", "Reviewer", "agt_a2"},
+	} {
+		ag, err := resolve(ctx, c.caller, c.ref)
+		if err != nil || ag == nil || ag.Name() != c.want {
+			t.Fatalf("%s → %q: got %v, %v; want %s", c.caller, c.ref, ag, err, c.want)
+		}
+	}
+	for _, c := range []struct{ caller, ref, why string }{
+		{"app", "Bob Draft", "bob's draft by name"},
+		{"app", "agt_bdraft", "bob's draft by id"},
+		{"u_alice", "agt_bdraft", "bob's draft from alice's own agent"},
+		{"app", "Billing", "an unmarked account agent"},
+		{"app", "agt_a2", "account agent → alice's private agent"},
+		{"app", "Writer", "account agent → alice's private agent by name"},
+		{"u_bob", "小微", "a caller that isn't this space's"},
+	} {
+		if ag, err := resolve(ctx, c.caller, c.ref); err == nil {
+			t.Fatalf("%s resolved to %v", c.why, ag.Name())
+		}
+	}
+	// An unknown name lists what may be reached, and nothing more.
+	_, err = resolve(ctx, "app", "nobody")
+	if err == nil || !strings.Contains(err.Error(), "小微") || !strings.Contains(err.Error(), "Alice Draft") ||
+		strings.Contains(err.Error(), "Bob Draft") || strings.Contains(err.Error(), "Billing") || strings.Contains(err.Error(), "Writer") {
+		t.Fatalf("unknown-name error = %v", err)
+	}
+}
+
+// The roster matches what message_agent resolves: in alice's space an
+// account agent sees the marked account agents (hers first, then public),
+// never bob's draft, unmarked ones or her private agents; her own agent
+// also sees her other own agents, listed first.
+func TestMessageAgentRoster(t *testing.T) {
+	st := privateAgentFixture(t)
+	ctx := context.Background()
+	for _, a := range []store.AgentRecord{
+		{ID: "agt_pub", UserID: "app", Name: "小微", Config: map[string]any{store.AgentCfgEndUserVisibility: store.EndUserVisibilityPublic, "description": "爱夸人的陪聊"}},
+		{ID: "agt_adraft", UserID: "app", Name: "Alice Draft", Config: map[string]any{store.AgentCfgEndUserVisibility: store.EndUserVisibilityPrivate, store.AgentCfgEndUserOwner: "u_alice"}},
+		{ID: "agt_bdraft", UserID: "app", Name: "Bob Draft", Config: map[string]any{store.AgentCfgEndUserOwner: "u_bob"}},
+	} {
+		a := a
+		if err := st.SaveAgent(ctx, &a); err != nil {
+			t.Fatal(err)
+		}
+	}
+	list := messageAgentLister(st, "u_alice", "app", "u_alice")
+	names := func(caller string) []string {
+		got, err := list(ctx, caller)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := []string{}
+		for _, a := range got {
+			out = append(out, a.Name)
+		}
+		return out
+	}
+	if got := strings.Join(names("app"), ","); got != "Alice Draft,小微" {
+		t.Fatalf("account agent's roster = %s", got)
+	}
+	got := names("u_alice")
+	if len(got) != 4 || got[2] != "Alice Draft" || got[3] != "小微" ||
+		!strings.Contains(strings.Join(got[:2], ","), "Writer") || !strings.Contains(strings.Join(got[:2], ","), "Reviewer") {
+		t.Fatalf("alice's own agent's roster = %v", got)
+	}
+	if got := names("u_bob"); len(got) != 0 {
+		t.Fatalf("foreign caller's roster = %v", got)
 	}
 }

@@ -18,10 +18,12 @@ import (
 
 	"github.com/fastclaw-ai/fastclaw/internal/agent/goal"
 	"github.com/fastclaw-ai/fastclaw/internal/agent/tools"
+	"github.com/fastclaw-ai/fastclaw/internal/billing"
 	"github.com/fastclaw-ai/fastclaw/internal/buildinfo"
 	"github.com/fastclaw-ai/fastclaw/internal/bus"
 	"github.com/fastclaw-ai/fastclaw/internal/channels"
 	"github.com/fastclaw-ai/fastclaw/internal/config"
+	"github.com/fastclaw-ai/fastclaw/internal/drain"
 	"github.com/fastclaw-ai/fastclaw/internal/mcp"
 	"github.com/fastclaw-ai/fastclaw/internal/privacy"
 	"github.com/fastclaw-ai/fastclaw/internal/provider"
@@ -61,11 +63,14 @@ type Agent struct {
 	// even after the operator explicitly chose chatbot/customize.
 	// PromptMode also drives the per-turn tool filter via
 	// builtinAllowForMode below.
-	promptMode    string
-	homePath      string // agent's home: SOUL.md, sessions, memory, skills
-	workspacePath string // working dir where agent creates user files
-	homeDir       string // FastClaw root, ~/.fastclaw
-	ownerUserID   string // the UserSpace user the agent runs for (hook / data namespacing)
+	promptMode string
+	// listReachableAgents: the message_agent roster (nil = none). Set by
+	// registerMessageAgent.
+	listReachableAgents func(ctx context.Context) ([]AgentBrief, error)
+	homePath            string // agent's home: SOUL.md, sessions, memory, skills
+	workspacePath       string // working dir where agent creates user files
+	homeDir             string // FastClaw root, ~/.fastclaw
+	ownerUserID         string // the UserSpace user the agent runs for (hook / data namespacing)
 	// agentOwnerID is agents.user_id — the account that actually owns the
 	// agent. It differs from ownerUserID whenever the agent runs in another
 	// user's space (an app's end-user, a public-link visitor, an admin
@@ -128,6 +133,10 @@ type Agent struct {
 	// agent loop checks the owner's quota before processing a turn.
 	// Nil means no quota enforcement (unlimited).
 	quotaStore usage.QuotaStore
+	// billing records usage events and asks the paying account's billing
+	// hook before turns and costly tools (docs/usage-metering.md). Nil
+	// records nothing and allows everything.
+	billing *billing.Service
 	// sandboxPool is the per-user (agent + session) sandbox pool. Set
 	// once at boot/hot-reload by attachSandboxToAgents; bindSession
 	// pulls a session-scoped executor from it at the top of every turn
@@ -1657,9 +1666,10 @@ func renderChatbotPersistenceReminder(mode, displayName, userMD, memoryMD string
 // stay in lockstep.
 //
 // Returns "" for non-chat transports such as API calls, where inserting
-// a UI control token into the response would be surprising.
+// a UI control token into the response would be surprising — unless the
+// API caller said it relays the reply into a chat (msg.ChatReply).
 func renderChannelHints(msg bus.InboundMessage, splitEnabled bool) string {
-	if !splitEnabled || (msg.Channel != "web" && !isIMChannel(msg.Channel)) {
+	if !splitEnabled || (msg.Channel != "web" && !isIMChannel(msg.Channel) && !msg.ChatReply) {
 		return ""
 	}
 	return "## Reply Format\n\n" +
@@ -2330,6 +2340,8 @@ func (a *Agent) runToolsWithProgress(ctx context.Context, toolCalls []provider.T
 
 // HandleMessage processes an inbound message through the ReAct loop.
 func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) string {
+	// A deploy waits for this turn before the process exits (drain).
+	defer drain.Track()()
 	// Check for slash commands first. Empty reply means "handled but
 	// intentionally silent" — /goal foo and /goal resume both fall
 	// through to a streaming continuation that IS the response, so
@@ -2363,6 +2375,15 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 		emitEvent(ctx, ChatEvent{Type: "content", Data: map[string]any{"content": rejection}})
 		emitEvent(ctx, ChatEvent{Type: "done"})
 		return rejection
+	}
+	// Billing hook (docs/usage-metering.md): the paying account may
+	// refuse the turn; its message is the reply. Also starts the turn's
+	// metering scope (turn_id) for every usage event below.
+	ctx, billingRejection := a.beginBillingTurn(ctx, msg)
+	if billingRejection != "" {
+		emitEvent(ctx, ChatEvent{Type: "content", Data: map[string]any{"content": billingRejection}})
+		emitEvent(ctx, ChatEvent{Type: "done"})
+		return billingRejection
 	}
 
 	// Plan mode short-circuits the ReAct loop: tools off, the model
@@ -2446,6 +2467,8 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 	// The person's own computers (agl): run_local_agent on 1:1 IM turns
 	// of the person the chat belongs to; see mountLocalAgents.
 	localAgentsNote := a.mountLocalAgents(ctx, msg)
+	// The other FastClaw agents message_agent can reach (roster).
+	agentsNote := a.reachableAgentsNote(ctx, msg)
 
 	// Steering: mark a turn in-flight so messages arriving mid-run are
 	// buffered onto the session (drained between tool iterations below)
@@ -2527,6 +2550,9 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 	}
 	if connectorNote != "" {
 		messages = append(messages, provider.Message{Role: "system", Content: connectorNote})
+	}
+	if agentsNote != "" {
+		messages = append(messages, provider.Message{Role: "system", Content: agentsNote})
 	}
 	if localAgentsNote != "" {
 		messages = append(messages, provider.Message{Role: "system", Content: localAgentsNote})
@@ -3306,6 +3332,10 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 	if rejection := a.checkQuota(ctx); rejection != "" {
 		return a.stringStream(rejection)
 	}
+	ctx, billingRejection := a.beginBillingTurn(ctx, msg)
+	if billingRejection != "" {
+		return a.stringStream(billingRejection)
+	}
 
 	chatterUID := a.chatterUserID(msg)
 	ctx = sandbox.WithUserID(ctx, chatterUID)
@@ -3979,6 +4009,11 @@ var chatbotBuiltinAllowlist = []string{
 	// extension mechanism — without exec the chatbot can't run them.
 	"exec",
 	"load_skill",
+	// message_agent: "ask 小微 to …" from a chat persona. It reaches only
+	// agents the space may reach (the owner's own; for a product's end
+	// user, the agents the product marked for them), so a chatbot with
+	// nothing reachable just gets an error listing none.
+	"message_agent",
 }
 
 // builtinAllowForMode returns the built-in tool name allowlist for the
