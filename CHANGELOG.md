@@ -5,6 +5,21 @@ action on upgrade — read those notes before deploying.
 
 ## [Unreleased]
 
+### Added — bring your own Connany key
+
+Console → Tools → Connectors takes a person's own Connany address and
+project key (public HTTPS only, checked before saving). Their accounts and
+agents use it before the deployment's connector service, so connectors work
+for them even when the deployment configured none. See
+`docs/connectors.md`.
+
+### Added — Console → Tools
+
+A new Console → Tools page (below Connectors), laid out like Admin → Tools,
+holds a person's own tool settings: used first, with the deployment's tools
+as the fallback. Its first entry is which Connany holds their connector
+accounts; the accounts themselves stay in Console → Connectors.
+
 ### Added — one-click agl updates
 
 Console → Devices marks a computer whose agl is behind the newest release

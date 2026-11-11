@@ -22,11 +22,36 @@ Alternatively, environment variables (used when nothing is saved in the UI):
 | `FASTCLAW_CONNANY_URL` | Connany's origin. HTTPS, or HTTP on `localhost` for development. |
 | `FASTCLAW_CONNANY_API_KEY` | The project key. Scrubbed from the process environment after boot. |
 
-Neither → connectors are off: the Connectors page shows "not available", agents get no
-tool. For `make dev`, the env vars can go in an untracked `.env.dev`.
+For `make dev`, the env vars can go in an untracked `.env.dev`.
 
 Each person then connects their own accounts in **Console → Connectors**
 (below Skills in the console sidebar).
+
+### A person's own Connany key
+
+Like models and skills, a person may bring their own: in **Console → Tools
+→ Connectors** (settings only; the accounts stay in Console → Connectors),
+**Use my own key** takes a Connany address and project key (checked
+against the service before it is saved, `PUT /api/connectors-config`). Their
+accounts then live in their Connany project, and their agents use it;
+without one they use the deployment's service. So connectors work for
+someone who brings a key even when the deployment configured none — with
+neither, the page asks for a key and agents get no tool.
+
+- The address must be a public `https://` origin: every address the host
+  resolves to is checked (again at dial time) against loopback, private,
+  link-local and CGNAT ranges, so the setting can't reach the server's own
+  network.
+- The key is stored per user (a `setting` config row in their scope) and
+  never leaves the server; the form sees its last four characters.
+- Accounts don't move between projects: switching keys shows the accounts
+  of the project now in use.
+- Rate limits are per project key: one key cooling down after a 429 doesn't
+  hold up the others.
+- A product's end users (app_users, `X-Fastclaw-End-User`) use the product
+  account's own key, never one of their own (`connectors.For`, source
+  `account`), else the deployment's. Their accounts still belong to them
+  alone (subject = their app_user id).
 
 ## Ownership
 
@@ -42,10 +67,27 @@ Each person then connects their own accounts in **Console → Connectors**
 
 ## Where accounts are usable
 
-The `connectors` tool is mounted only on a **web** turn whose **chatter owns
-the agent** (`Agent.mountConnectors`). Not in IM channels, groups, cron, the
-`/v1` API, or on someone else's agent — there the reader of the reply, or the
-author of the agent's instructions, isn't the account's owner.
+The `connectors` tool is mounted (`Agent.mountConnectors`) only on:
+
+- a **web** turn whose **chatter owns the agent**; or
+- an app **end user's** own 1:1 turn (web or `/v1` API, `X-Fastclaw-End-User`)
+  on an agent of the app's account marked as theirs (`endUserOwner`, see
+  `gateway.endUserConnectorGate`). Their subject is their own app_user id,
+  so accounts are theirs alone, usable across all of their agents — but not
+  on the app's public agents, whose instructions are someone else's. The app
+  passes its own connect page as the turn param `__fastclawConnectorsURL`
+  (hidden from the model's client-parameters note), and optionally
+  `__fastclawConnectorsReturnURL`. The tool's request actions then mint a
+  one-time authorization link (no ChatRef: an IM turn can't be woken) for
+  the model to send in the 1:1 chat, returning to that URL; if minting
+  fails, they return the connect page with `?connector=<name>`. On the
+  app's own page, authorization returns there (`returnUrl` on
+  `POST /api/connector-authorizations`, end-user callers only).
+
+Not in IM channels, groups, cron, or on someone else's agent — there the
+reader of the reply, or the author of the agent's instructions, isn't the
+account's owner. The tool is unregistered at the start of every turn, so a
+mount never carries over to the next turn.
 
 ## The tool
 
