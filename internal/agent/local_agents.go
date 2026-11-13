@@ -139,5 +139,41 @@ func (a *Agent) mountLocalAgents(ctx context.Context, msg bus.InboundMessage) st
 			tools.RegisterGenerateImage(a.registry, maker, save, uid, chat, notify)
 		}
 	}
-	return tools.LocalAgentsNote(machines)
+	return tools.LocalAgentsNote(machines) + a.mountComputerTools(lctx, svc, uid, chat, notify, machines)
+}
+
+// mountComputerTools puts computer_* (agl's built-in read / write / edit /
+// exec) on the turn for the person's online computers whose agl offers
+// them, coding agent or not, and returns the hint for them ("" when there
+// are none). The model chooses between them and run_local_agent.
+func (a *Agent) mountComputerTools(ctx context.Context, svc tools.LocalAgentRunner, uid string, chat agl.ToolChat, notify func(agl.ToolNotice), machines []agl.LocalMachine) string {
+	runner, ok := svc.(tools.LocalBuiltinRunner)
+	if !ok {
+		return ""
+	}
+	offered := map[string]agl.BuiltinTool{}
+	var names, agentless []string
+	for _, m := range machines {
+		if !agl.UsesBuiltinTools(m) {
+			continue
+		}
+		list := runner.BuiltinTools(ctx, m)
+		if len(list) == 0 {
+			continue
+		}
+		names = append(names, m.Name)
+		if len(m.Agents) == 0 {
+			agentless = append(agentless, m.Name)
+		}
+		for _, bt := range list {
+			if _, seen := offered[bt.Name]; !seen {
+				offered[bt.Name] = bt
+			}
+		}
+	}
+	if len(offered) == 0 {
+		return ""
+	}
+	tools.RegisterComputerTools(a.registry, runner, uid, chat, notify, offered, names)
+	return tools.ComputerToolsNote(names, agentless, offered)
 }

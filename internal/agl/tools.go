@@ -69,6 +69,9 @@ type LocalMachine struct {
 	// AglVersion is the machine's agl (decides whether its agents'
 	// capabilities are reported or assumed; see Capabilities).
 	AglVersion string
+	// AppName is the product the machine was linked for ("" = none
+	// known): agl's app_name, so macOS privacy prompts name it.
+	AppName string
 }
 
 // HasAgent reports whether agent may run on m. A machine that reported
@@ -155,6 +158,9 @@ type toolApproval struct {
 	agent     string // display names, for PendingApproval
 	machine   string
 	notify    func(ToolNotice) // nil: IM chat
+	// answer, when set, receives the decision instead of session.approve:
+	// a built-in tool call waiting in CallBuiltin (builtin.go).
+	answer chan<- string
 }
 
 // Tools runs tool-mode turns on users' machines.
@@ -171,6 +177,7 @@ type Tools struct {
 	mu      sync.Mutex
 	pending map[string]*toolApproval // ToolChat.key() → open permission request
 	grants  *sessionGrants
+	builtin builtinCache // machine → its built-in tools (builtin.go)
 }
 
 // NewTools returns the tool-mode runner over link.
@@ -189,6 +196,7 @@ func (t *Tools) Machines(ctx context.Context, userID string) ([]LocalMachine, er
 		return nil, err
 	}
 	out := make([]LocalMachine, 0, len(list))
+	apps := map[string]string{}
 	for i := range list {
 		m := &list[i]
 		if m.Revoked() || !m.AllowAgents || m.UserID != userID {
@@ -205,6 +213,7 @@ func (t *Tools) Machines(ctx context.Context, userID string) ([]LocalMachine, er
 		if lm.DefaultAccess == "" {
 			lm.DefaultAccess = AccessAsk
 		}
+		lm.AppName = t.hubAppName(ctx, m.HubScope, apps)
 		for _, a := range m.Agents {
 			if a.Available && !HiddenAgent(a.ID) && !m.AgentSetting(a.ID).Disabled {
 				lm.Agents = append(lm.Agents, a)
@@ -332,7 +341,7 @@ func (t *Tools) Run(ctx context.Context, r ToolRun) (string, error) {
 	defer unsubscribe()
 
 	name := ToolSessionName(m.ID, agent, r.Chat)
-	sid, _, err := openSession(runCtx, t.link, m.ID, agent, cwd, m.DefaultAccess, name, m.Settings[agent])
+	sid, _, err := openSession(runCtx, t.link, m.ID, agent, cwd, m.DefaultAccess, name, m.AppName, m.Settings[agent])
 	if err != nil {
 		if errors.Is(err, ErrOffline) {
 			return "", toolErr("The computer %s went offline. Tell the person to check it and try again.", m.Name)
@@ -604,6 +613,15 @@ func (t *Tools) Decide(ctx context.Context, chat ToolChat, userID, decision stri
 	}
 	delete(t.pending, chat.key())
 	t.mu.Unlock()
+	if a.answer != nil {
+		a.answer <- decision // buffered; the waiter runs the call
+		if a.notify != nil {
+			a.notify(ToolNotice{Kind: NoticeApprovalResolved, Agent: a.agent, Machine: a.machine, Decision: decision})
+		} else {
+			t.send(a.chat, approvalAck[decision])
+		}
+		return true, nil
+	}
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	if err := approve(ctx, t.link, a.machineID, &a.p, decision); err != nil {
@@ -622,4 +640,22 @@ func (t *Tools) Decide(ctx context.Context, chat ToolChat, userID, decision stri
 		t.send(a.chat, approvalAck[decision])
 	}
 	return true, nil
+}
+
+// hubAppName is scope's display name, looked up once per scope in seen.
+func (t *Tools) hubAppName(ctx context.Context, scope string, seen map[string]string) string {
+	if scope == "" {
+		return ""
+	}
+	if name, ok := seen[scope]; ok {
+		return name
+	}
+	name := ""
+	if as, ok := t.store.(store.HubAppStore); ok {
+		if n, err := as.HubAppName(ctx, scope); err == nil {
+			name = n
+		}
+	}
+	seen[scope] = name
+	return name
 }

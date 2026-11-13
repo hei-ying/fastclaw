@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -274,6 +275,40 @@ func (s *Server) HandleCreateMachinePairing(w http.ResponseWriter, r *http.Reque
 	if ident.AuthMethod == "apikey" && ident.EndUser != "" {
 		scope = agl.ProductScope(ident.AccountID())
 	}
+	// access (optional): the link's access on the computer — "full" lets
+	// agents run commands there with agl's built-in tools, "edit" change
+	// files; default ask (read only).
+	// appName (optional, products only): the product's display name. agl
+	// runs the link's commands and agents under it, so macOS privacy
+	// prompts on the computer name the product instead of "agl".
+	var body struct {
+		Access  string `json:"access"`
+		AppName string `json:"appName"`
+	}
+	if r.ContentLength != 0 {
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+			writeFlatError(w, http.StatusBadRequest, "invalid JSON body")
+			return
+		}
+	}
+	access, ok := agl.LinkAccess(body.Access)
+	if !ok {
+		writeFlatError(w, http.StatusBadRequest, `access must be "ask", "read_only", "edit" or "full"`)
+		return
+	}
+	if strings.TrimSpace(body.AppName) != "" && scope != "" {
+		name, ok := agl.ValidAppName(body.AppName)
+		if !ok {
+			writeFlatError(w, http.StatusBadRequest, "appName must be 1–48 characters without quotes, /, :, \\, $ or backticks")
+			return
+		}
+		if as, ok := s.store.(store.HubAppStore); ok {
+			if err := as.SetHubAppName(r.Context(), scope, name); err != nil {
+				writeFlatError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+		}
+	}
 	code, exp, err := s.aglHub.CreateScopedPairing(r.Context(), ident.UserID, scope)
 	if err != nil {
 		writeFlatError(w, http.StatusInternalServerError, err.Error())
@@ -281,7 +316,8 @@ func (s *Server) HandleCreateMachinePairing(w http.ResponseWriter, r *http.Reque
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"code":           code,
-		"installCommand": s.aglHub.ScopedInstallCommand(r, code, scope),
+		"access":         access,
+		"installCommand": s.aglHub.InstallCommandWithAccess(r, code, scope, access),
 		"expiresAt":      exp.UTC().Format(time.RFC3339),
 	})
 }

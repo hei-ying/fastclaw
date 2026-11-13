@@ -54,6 +54,10 @@ type fakeLink struct {
 	requests []string // method + " " + params JSON
 	events   chan Event
 	history  string // session.history result (JSON), when set
+	// toolsList is the tools.list result (JSON); default: read only.
+	toolsList string
+	// toolsCall is the tools.call result (JSON); default: {"ok":true}.
+	toolsCall string
 }
 
 func newFakeLink() *fakeLink { return &fakeLink{online: true, events: make(chan Event, 64)} }
@@ -72,6 +76,24 @@ func (f *fakeLink) Request(_ context.Context, _ string, method string, params an
 		return json.RawMessage(`{"session_id":"s1"}`), nil
 	case "fs.read":
 		return json.RawMessage(`{"content_base64":"aGk=","size":2}`), nil
+	case "tools.list":
+		f.mu.Lock()
+		tl := f.toolsList
+		f.mu.Unlock()
+		if tl == "" {
+			tl = `[{"name":"read","description":"Read.","input_schema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}}]`
+		}
+		return json.RawMessage(tl), nil
+	case "tools.call":
+		f.mu.Lock()
+		tc := f.toolsCall
+		f.mu.Unlock()
+		if tc == "" {
+			tc = `{"ok":true}`
+		}
+		return json.RawMessage(tc), nil
+	case "tools.approve":
+		return json.RawMessage(`{"ok":"approved"}`), nil
 	case "session.history":
 		f.mu.Lock()
 		h := f.history

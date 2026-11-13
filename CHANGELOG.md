@@ -5,6 +5,58 @@ action on upgrade — read those notes before deploying.
 
 ## [Unreleased]
 
+### Added — macOS privacy prompts name the product, not agl
+
+`POST /v1/machines/pairing` takes an optional `appName` (the product's
+display name), stored per product hub scope. Commands from `computer_exec`
+and local agent sessions on those computers pass it to agl as `app_name`,
+so macOS asks "WeClaw wants to access Downloads" instead of "agl …",
+also on computers linked earlier. New install commands carry
+`--app-name` when the name is one word. File reads through agl's daemon
+(`computer_read`, `send_local_file`) are still attributed to agl.
+
+### Changed — agents pick direct computer tools or the local coding agent
+
+`computer_read/write/edit/exec` (agl's built-in tools) are now mounted on
+every linked computer with agl ≥ 0.3.14, not only those without a coding
+agent. The model chooses per request: quick look-ups and a command or two
+run directly, substantial or multi-step work goes to `run_local_agent`,
+and a call the link doesn't allow is handed to the coding agent. With agl
+≥ 0.3.15, writes and commands that aren't read-only are approved by the
+person in the chat (1/2/3 or the web card) instead of being refused, so
+the default `ask` link can do more than read. See `docs/agl-machines.md`.
+
+### Added — force the sandbox from the admin UI
+
+Admin → Tools → Runtime → Sandbox has a "强制在沙盒执行" toggle
+(`sandbox.enforce`): every exec runs in the sandbox, never on the host.
+It takes effect on save, no restart. Same effect as
+`FASTCLAW_SANDBOX_ENFORCE=1`, which (like hosted deploys) still enforces
+regardless of the toggle.
+
+### Fixed — BoxLite sandboxes failed to start
+
+BoxLite Cloud started rejecting the `auto_remove` create field, so every
+box failed with `property auto_remove should not exist`. A cold image
+pull that outlasts BoxLite's start wait (HTTP 408) is now waited out
+instead of failing.
+
+### Fixed — cropped browser screenshots in the sandbox image
+
+`camoufox-cli screenshot` captured only the top-left 1280×720 of pages
+laid out at the fingerprinted window width. Fixed in the sandbox image,
+now published as `thinkany/fastclaw-sandbox:20261112` and used by default.
+BoxLite Cloud never re-pulls a moved `:latest`, so the default is now a
+dated tag; if Admin → Tools → Runtime pins `thinkany/fastclaw-sandbox`
+(or `:latest`), clear the field or set the dated tag.
+
+### Fixed — sandbox settings page showed stale values
+
+The sandbox is deployment-wide but was also copied into users' own
+settings whenever they saved anything, and those copies shadowed the
+system value on the settings page. It is now system-only, and clearing an
+optional field (image, URL) on the page actually clears it.
+
 ### Added — connectors for a product's end users
 
 A product calling FastClaw for its end users (`X-Fastclaw-End-User`) can

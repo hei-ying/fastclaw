@@ -157,6 +157,42 @@ func TestUpdateConfigMaskedAgentSkillEntryKeepsStoredSecret(t *testing.T) {
 	}
 }
 
+// The configure dialog posts one skill at a time; saving the second
+// skill must not drop the first skill's env from the agent's row.
+func TestUpdateConfigAgentSkillEntryPatchKeepsOtherSkills(t *testing.T) {
+	ctx := context.Background()
+	s, resolver, adminUser, _ := newAuthTestServer(t, ctx)
+
+	if err := s.dataStore.SaveAgent(ctx, &store.AgentRecord{ID: "agent-1", UserID: adminUser.ID, Name: "Test Agent"}); err != nil {
+		t.Fatalf("SaveAgent: %v", err)
+	}
+	post := func(skill, key, value string) {
+		t.Helper()
+		body := map[string]any{"skills": map[string]any{"agentEntries": map[string]any{
+			"agent-1": map[string]any{skill: map[string]any{"enabled": true, "env": map[string]any{key: value}}},
+		}}}
+		rr := httptest.NewRecorder()
+		s.authMiddleware(s.handleUpdateConfig)(rr, configTestRequest(t, ctx, resolver, http.MethodPost, "/api/config", adminUser.ID, body))
+		if rr.Code != http.StatusOK {
+			t.Fatalf("POST /api/config status = %d, body = %s", rr.Code, rr.Body.String())
+		}
+	}
+
+	post("skill-a", "A_TOKEN", "token-a-123456")
+	post("skill-b", "B_KEY", "key-b-123456")
+
+	entries, err := loadAgentSkillEntries(ctx, s.dataStore, "agent-1")
+	if err != nil {
+		t.Fatalf("loadAgentSkillEntries: %v", err)
+	}
+	if got := entries["skill-a"].Env["A_TOKEN"]; got != "token-a-123456" {
+		t.Fatalf("saving skill-b dropped skill-a env: got %q (entries=%+v)", got, entries)
+	}
+	if got := entries["skill-b"].Env["B_KEY"]; got != "key-b-123456" {
+		t.Fatalf("skill-b env not saved: got %q", got)
+	}
+}
+
 func TestMergeSkillEntry(t *testing.T) {
 	existing := config.SkillEntryCfg{
 		Enabled: true,
@@ -350,5 +386,49 @@ func TestDeleteProviderClearsDanglingDefaultModel(t *testing.T) {
 	}
 	if d := defaults(regularUser.ID); d["model"] != "acme/fast" {
 		t.Fatalf("regular user defaults = %v, want model kept (own provider)", d)
+	}
+}
+
+// The sandbox is deployment-wide: a user-scope save must not snapshot it
+// into the user's row, and a stale user row (written before this was
+// fixed) must not shadow the system value in any view. Production hit
+// exactly that — admin switched to boxlite, the page kept showing e2b.
+func TestSandboxSettingIsSystemOnly(t *testing.T) {
+	ctx := context.Background()
+	s, resolver, adminUser, _ := newAuthTestServer(t, ctx)
+
+	post := func(path string, body map[string]any) {
+		t.Helper()
+		rr := httptest.NewRecorder()
+		s.authMiddleware(s.handleUpdateConfig)(rr, configTestRequest(t, ctx, resolver, http.MethodPost, path, adminUser.ID, body))
+		if rr.Code != http.StatusOK {
+			t.Fatalf("POST %s status = %d, body = %s", path, rr.Code, rr.Body.String())
+		}
+	}
+	post("/api/config?scope=system", map[string]any{"sandbox": map[string]any{"enabled": true, "backend": "e2b"}})
+	post("/api/config?scope=user", map[string]any{"agents": map[string]any{"defaults": map[string]any{"model": "personal/m"}}})
+	if rec, _ := s.dataStore.GetConfigByName(ctx, store.KindSetting, adminUser.ID, "", "sandbox"); rec != nil {
+		t.Fatalf("user-scope save wrote a user sandbox row: %+v", rec.Data)
+	}
+
+	// A stale user row from before the fix.
+	if err := s.dataStore.SaveConfig(ctx, &store.ConfigRecord{
+		Kind: store.KindSetting, UserID: adminUser.ID, Name: "sandbox", Enabled: true,
+		Data: map[string]interface{}{"enabled": true, "backend": "e2b"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	post("/api/config?scope=system", map[string]any{"sandbox": map[string]any{"enabled": true, "backend": "boxlite"}})
+
+	for _, path := range []string{"/api/config", "/api/config?scope=system", "/api/config?scope=user"} {
+		rr := httptest.NewRecorder()
+		s.authMiddleware(s.handleGetConfig)(rr, configTestRequest(t, ctx, resolver, http.MethodGet, path, adminUser.ID, nil))
+		var view struct {
+			Sandbox config.SandboxCfg `json:"sandbox"`
+		}
+		_ = json.Unmarshal(rr.Body.Bytes(), &view)
+		if view.Sandbox.Backend != "boxlite" {
+			t.Fatalf("GET %s sandbox backend = %q, want boxlite", path, view.Sandbox.Backend)
+		}
 	}
 }
