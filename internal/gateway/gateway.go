@@ -19,6 +19,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -34,6 +35,7 @@ import (
 	"github.com/fastclaw-ai/fastclaw/internal/cron"
 	"github.com/fastclaw-ai/fastclaw/internal/drain"
 	"github.com/fastclaw-ai/fastclaw/internal/plugin"
+	"github.com/fastclaw-ai/fastclaw/internal/redact"
 	"github.com/fastclaw-ai/fastclaw/internal/rediscoord"
 	coderuntime "github.com/fastclaw-ai/fastclaw/internal/runtime"
 	"github.com/fastclaw-ai/fastclaw/internal/sandbox"
@@ -193,6 +195,7 @@ func buildToolChainFromResolved(resolved config.ResolvedAgent, category string) 
 		Registry:     toolProviderRegistry,
 		GetConfig: func(name string) toolproviders.ProviderConfig {
 			pc := providers[name]
+			redact.Register(pc.APIKey)
 			return toolproviders.ProviderConfig{
 				APIKey:   pc.APIKey,
 				Endpoint: pc.Endpoint,
@@ -541,6 +544,48 @@ func New(env *config.EnvConfig) (*Gateway, error) {
 		}
 		chanMgr.SendTyping(task.Message.Channel, task.AccountID, task.Message.ChatID)
 		stopMsgTyping := chanMgr.StartMessageTyping(task.Message.Channel, task.AccountID, task.Message.ChatID, task.Message.MessageID)
+		// IM turns: what the model says alongside a tool call (a plan, a
+		// progress line) goes out right away, and a turn that has said
+		// nothing for progressPingAfter gets a "still working" line, so a
+		// long task isn't minutes of silence. Raw "calling X…" lines stay
+		// off (too noisy). Web chat streams events instead.
+		im := task.Message.Channel != "web" && chanMgr.Has(task.Message.Channel, task.AccountID)
+		turnStart := time.Now()
+		var lastSaid atomic.Int64
+		lastSaid.Store(turnStart.UnixNano())
+		var interimMedia atomic.Bool
+		pushInterim := func(text string, items []bus.MediaItem) {
+			if strings.TrimSpace(text) == "" && len(items) == 0 {
+				return
+			}
+			out := bus.OutboundMessage{
+				Channel:    task.Message.Channel,
+				AccountID:  task.AccountID,
+				AgentID:    task.AgentID,
+				ChatID:     task.Message.ChatID,
+				Text:       text,
+				ParseMode:  "Markdown",
+				MediaItems: items,
+				AllowSplit: ag.SplitReplies(),
+			}
+			select {
+			case mb.Outbound <- out:
+				lastSaid.Store(time.Now().UnixNano())
+			case <-ctx.Done():
+			}
+		}
+		if im {
+			ctx = agent.WithInterimSender(ctx, func(text string) {
+				t, items := splitMediaFromReply(ctx, g.workspace, task.AgentID, task.Message.ProjectID, task.Message.ChatID, text)
+				t, files := splitFilesFromReply(ctx, g.workspace, task.AgentID, task.Message.ProjectID, task.Message.ChatID, t)
+				items = append(items, files...)
+				if len(items) > 0 {
+					interimMedia.Store(true)
+				}
+				pushInterim(t, items)
+			})
+		}
+		zh := agent.PrefersChinese(task.Message.Text)
 		typingDone := make(chan struct{})
 		go func() {
 			ticker := time.NewTicker(5 * time.Second)
@@ -553,15 +598,12 @@ func New(env *config.EnvConfig) (*Gateway, error) {
 					return
 				case <-ticker.C:
 					chanMgr.SendTyping(task.Message.Channel, task.AccountID, task.Message.ChatID)
+					if im && time.Since(time.Unix(0, lastSaid.Load())) >= progressPingAfter {
+						pushInterim(progressPing(zh, time.Since(turnStart)), nil)
+					}
 				}
 			}
 		}()
-
-		// IM channels show only the final reply — no per-tool_call
-		// progress messages. Users see a typing indicator (above)
-		// during the run; intermediate "calling X…" lines added too
-		// much noise on multi-tool turns. Web UI subscribes to chat
-		// events directly via HandleWebChatStream and is unaffected.
 
 		// Snapshot the workspace before the turn. The post-turn media
 		// fallback must only attach files created by this turn; sandbox
@@ -614,7 +656,7 @@ func New(env *config.EnvConfig) (*Gateway, error) {
 		// addition to the final output. Its final reply is authoritative and
 		// the system prompt requires the agent to link each final deliverable.
 		// Other channels retain the legacy safety net for compatibility.
-		if len(items) == 0 && task.Message.Channel != "wechat" {
+		if len(items) == 0 && task.Message.Channel != "wechat" && !interimMedia.Load() {
 			items = appendNewWorkspaceMedia(ctx, g.workspace, task.AgentID, task.Message.ProjectID, task.Message.ChatID, workspaceBefore, workspaceSnapshotOK, items)
 		}
 		// Web-streamed turns already delivered the reply via the hub.
@@ -707,6 +749,8 @@ func (g *Gateway) IsCloudMode() bool { return true }
 func (g *Gateway) Run() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	// Hide our public egress IP from regular chatters' turns.
+	go redact.DiscoverEgressIP(ctx)
 
 	stopCh := make(chan os.Signal, 1)
 	signal.Notify(stopCh, syscall.SIGINT, syscall.SIGTERM)
@@ -1521,4 +1565,20 @@ func mimeExt(mime string) string {
 		return ".svg"
 	}
 	return ".bin"
+}
+
+// progressPingAfter is how long an IM turn may go without saying
+// anything before the person gets a "still working" line.
+const progressPingAfter = 3 * time.Minute
+
+// progressPing is the "still working" line for a turn running for d.
+func progressPing(zh bool, d time.Duration) string {
+	mins := int(d.Round(time.Minute) / time.Minute)
+	if mins < 1 {
+		mins = 1
+	}
+	if zh {
+		return fmt.Sprintf("还在处理，已经 %d 分钟了，做完马上告诉你。", mins)
+	}
+	return fmt.Sprintf("Still working on it (%d min so far). I'll reply as soon as it's done.", mins)
 }
