@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1050,8 +1051,19 @@ func (a *Agent) RegisterWebSearchChain(chain *toolproviders.Chain) {
 }
 
 // RegisterImageGenChain exposes the image_gen tool to this agent.
+// The pictures are stored in the calling chat's workspace.
 func (a *Agent) RegisterImageGenChain(chain *toolproviders.Chain) {
-	tools.RegisterImageGenChain(a.registry, chain)
+	tools.RegisterImageGenChain(a.registry, chain, &tools.ImageFiles{
+		Save: func(ctx context.Context, sessionID, projectID, name string, data []byte, contentType string) (string, error) {
+			url := "data:" + contentType + ";base64," + base64.StdEncoding.EncodeToString(data)
+			names := a.WriteSessionAttachments(ctx, sessionID, projectID, []Attachment{{URL: url, Name: name}})
+			if len(names) == 0 {
+				return "", errors.New("workspace write failed")
+			}
+			return names[0], nil
+		},
+		Load: a.loadSessionFile,
+	})
 }
 
 // RegisterWebFetchChain swaps the agent's web_fetch backend for a
@@ -2386,6 +2398,21 @@ func (a *Agent) handleMessage(ctx context.Context, msg bus.InboundMessage) strin
 		return result.reply
 	}
 
+	// One turn at a time per conversation: wait for the turn already
+	// running on it before loading the history (see session.LockTurn).
+	// Registered first, so it unlocks after every other defer of the
+	// turn has settled the history.
+	{
+		channel, accountID, chatID, _ := sessionTriple(msg, msg.ProjectID)
+		lockedCtx, unlock, err := a.sessions.LockTurn(ctx, channel, accountID, chatID)
+		if err != nil {
+			emitEvent(ctx, ChatEvent{Type: "done"})
+			return ""
+		}
+		ctx = lockedCtx
+		defer unlock()
+	}
+
 	a = a.forkTurn()
 	a.applyTurnModel(ctx)
 
@@ -2637,6 +2664,7 @@ func (a *Agent) handleMessage(ctx context.Context, msg bus.InboundMessage) strin
 	// splits on it (AllowSplit=true) or collapses to newlines otherwise.
 	var replyParts []string
 	outputLimitRetries := 0
+	emptyRetries := 0
 
 	stop := turnStop{reason: stopReasonCap, limit: a.toolIterationLimit(), zh: prefersChinese(msg.Text)}
 	loopWarned := false
@@ -2757,7 +2785,21 @@ func (a *Agent) handleMessage(ctx context.Context, msg bus.InboundMessage) strin
 		}
 
 		if !resp.HasToolCalls() {
+			// A reply with neither text nor tool calls is usually a
+			// provider hiccup (seen in bursts on DeepSeek): ask again
+			// before failing the turn.
+			if strings.TrimSpace(resp.Content) == "" && !resp.Truncated && emptyRetries < maxEmptyReplyRetries {
+				emptyRetries++
+				slog.Warn("model returned an empty reply — retrying",
+					"agent", a.name, "model", a.model, "thinking_bytes", len(resp.Thinking),
+					"output_tokens", resp.Usage.OutputTokens, "retry", emptyRetries)
+				i-- // the empty reply doesn't use up a tool round
+				continue
+			}
 			if strings.TrimSpace(resp.Content) == "" {
+				slog.Error("model returned an empty reply after retries",
+					"agent", a.name, "model", a.model, "truncated", resp.Truncated,
+					"thinking_bytes", len(resp.Thinking))
 				emptyMsg := "model returned an empty response"
 				if resp.Truncated {
 					emptyMsg = "the model's reply was cut off at its output limit before it produced anything usable"
